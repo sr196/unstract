@@ -44,6 +44,7 @@ dependencies = [
     # Note: Using dataclasses instead of pydantic for lightweight typing
     # Custom implementations replace tenancy (retry), pybreaker (circuit breaker)
     # - python-dateutil: Standard datetime module sufficient
+    "google-genai>=1.0.0",
 ]
 
 [dependency-groups]

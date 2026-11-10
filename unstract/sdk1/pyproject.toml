@@ -50,6 +50,7 @@ dependencies = [
     "llmwhisperer-client>=2.8.1",
     # # Core utilities (Redis Sentinel-aware client factory, etc.)
     "unstract-core",
+    "google-genai>=1.0.0",
 ]
 
 [project.optional-dependencies]

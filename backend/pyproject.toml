@@ -54,6 +54,7 @@ dependencies = [
     "unstract-workflow-execution",
     "unstract-filesystem",
     "google-cloud-recaptcha-enterprise>=1.28.2",
+    "google-genai>=1.0.0",
     "gunicorn>=23.0.0",
     "stripe>=12.5.1",
 ]

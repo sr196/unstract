@@ -1,0 +1,36 @@
+{
+  "title": "Gemini 2.0 Flash Text Extractor",
+  "type": "object",
+  "required": [
+    "adapter_name"
+  ],
+  "description": "Layout-preserving document extraction powered by Google Gemini 2.0 Flash. Supports PDF, PNG, JPEG, GIF, and WebP inputs. An API key is required; it can be supplied here or via the GEMINI_API_KEY environment variable.",
+  "properties": {
+    "adapter_name": {
+      "type": "string",
+      "title": "Name",
+      "default": "gemini-flash-1",
+      "description": "Provide a unique name for this adapter instance. Example: gemini-flash-1"
+    },
+    "api_key": {
+      "type": "string",
+      "title": "Google AI Studio API Key",
+      "format": "password",
+      "default": "",
+      "description": "API key from [Google AI Studio](https://aistudio.google.com/app/apikey). Leave empty to use the GEMINI_API_KEY environment variable instead."
+    },
+    "model_name": {
+      "type": "string",
+      "title": "Model Name",
+      "default": "gemini-2.0-flash",
+      "description": "Gemini model identifier to use for extraction. Defaults to `gemini-2.0-flash`. Other options: `gemini-1.5-flash`, `gemini-1.5-pro`."
+    },
+    "custom_prompt": {
+      "type": "string",
+      "title": "Custom System Prompt / Instructions",
+      "default": "",
+      "description": "Optional additional instructions appended to the built-in layout-preserving extraction prompt. Use this to customise output formatting, focus on specific sections, or handle domain-specific content."
+    }
+  }
+}
+
