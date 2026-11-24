@@ -115,6 +115,15 @@ class QwenVLAdapter(X2TextAdapter):
             or QwenVLDefaults.MODEL_NAME
         )
 
+    def _resolve_max_tokens(self) -> int:
+        val = self.config.get(QwenVLConfig.MAX_TOKENS)
+        if val is not None:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
+        return QwenVLDefaults.MAX_TOKENS
+
     def _build_system_prompt(self) -> str:
         """Combine the base extraction prompt with any user-supplied additions."""
         base = EXTRACTION_SYSTEM_PROMPT
@@ -195,8 +204,10 @@ class QwenVLAdapter(X2TextAdapter):
     def _pdf_to_base64_images(file_bytes: bytes) -> list[tuple[str, str]]:
         """Convert PDF bytes to a list of ``(base64_data, mime_type)`` tuples.
 
-        Each tuple represents one page rendered as a PNG image.  Uses
+        Each tuple represents one page rendered as a PNG image. Uses
         ``pdfplumber`` for page geometry and ``Pillow`` for rendering.
+        Pages are rendered at 150 DPI and capped at MAX_IMAGE_DIM to
+        prevent exceeding LLM context windows.
 
         Returns:
             List of ``(base64_encoded_png, "image/png")`` for each page.
@@ -218,15 +229,25 @@ class QwenVLAdapter(X2TextAdapter):
         try:
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
-                    # Render page to a PIL Image.
-                    # pdfplumber's .to_image() returns a PageImage wrapper;
-                    # .original is the underlying PIL Image.
-                    page_image = page.to_image(resolution=200)
+                    # Render page to a PIL Image at 150 DPI.
+                    page_image = page.to_image(resolution=QwenVLDefaults.PDF_RENDER_DPI)
                     pil_img: Image.Image = page_image.original
 
                     # Convert to RGB if needed (e.g. RGBA, P mode).
                     if pil_img.mode not in ("RGB", "L"):
                         pil_img = pil_img.convert("RGB")
+
+                    # Cap maximum dimension to avoid excessive vision tokens.
+                    max_dim = QwenVLDefaults.MAX_IMAGE_DIM
+                    w, h = pil_img.size
+                    if max(w, h) > max_dim:
+                        if w > h:
+                            new_w = max_dim
+                            new_h = max(1, int(h * (max_dim / w)))
+                        else:
+                            new_h = max_dim
+                            new_w = max(1, int(w * (max_dim / h)))
+                        pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
                     buf = BytesIO()
                     pil_img.save(buf, format="PNG")
@@ -245,7 +266,27 @@ class QwenVLAdapter(X2TextAdapter):
 
     @staticmethod
     def _image_to_base64(file_bytes: bytes, mime_type: str) -> str:
-        """Encode raw image bytes as a base64 string."""
+        """Encode raw image bytes as a base64 string, downscaling if oversized."""
+        try:
+            from PIL import Image  # type: ignore[import]
+
+            img = Image.open(BytesIO(file_bytes))
+            max_dim = QwenVLDefaults.MAX_IMAGE_DIM
+            w, h = img.size
+            if max(w, h) > max_dim:
+                if w > h:
+                    new_w = max_dim
+                    new_h = max(1, int(h * (max_dim / w)))
+                else:
+                    new_h = max_dim
+                    new_w = max(1, int(w * (max_dim / h)))
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                buf = BytesIO()
+                save_fmt = "JPEG" if mime_type in (QwenVLMimeTypes.JPEG, "image/jpeg") else "PNG"
+                img.save(buf, format=save_fmt)
+                return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            pass
         return base64.b64encode(file_bytes).decode("ascii")
 
     @staticmethod
@@ -274,50 +315,121 @@ class QwenVLAdapter(X2TextAdapter):
         except Exception as exc:
             logger.warning("QwenVL: could not write metadata sidecar: %s", exc)
 
-    def _build_image_content_parts(
+    def _call_model_for_page(
         self,
-        file_bytes: bytes,
-        mime_type: str,
-    ) -> list[dict[str, Any]]:
-        """Build the ``content`` list for the OpenAI vision chat message.
-
-        For PDFs, converts each page to a base64 PNG image part.
-        For images, creates a single base64 image_url part.
-
-        Returns:
-            List of content part dicts ready for the OpenAI API message format.
-        """
-        parts: list[dict[str, Any]] = []
-
-        if mime_type == QwenVLMimeTypes.PDF:
-            # Convert PDF pages to individual images.
-            page_images = self._pdf_to_base64_images(file_bytes)
-            for b64_data, img_mime in page_images:
-                parts.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{img_mime};base64,{b64_data}",
-                    },
-                })
-        else:
-            # Single image input.
-            b64_data = self._image_to_base64(file_bytes, mime_type)
-            parts.append({
+        client: Any,
+        b64_data: str,
+        img_mime: str,
+        page_num: int,
+        total_pages: int,
+        model_name: str,
+        system_prompt: str,
+        max_tokens: int,
+        base_url: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Submit a single page image to the model and return its extracted text."""
+        content_parts = [
+            {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:{mime_type};base64,{b64_data}",
+                    "url": f"data:{img_mime};base64,{b64_data}",
                 },
-            })
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"Extract all text from page {page_num} of this document, inserting "
+                    f"<<< PAGE_{page_num} >>> delimiters as instructed."
+                ),
+            },
+        ]
 
-        # Add the text instruction part.
-        parts.append({
-            "type": "text",
-            "text": (
-                "Extract all text from this document, inserting "
-                "<<< PAGE_{n} >>> delimiters as instructed."
-            ),
-        })
-        return parts
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content_parts},
+                ],
+                temperature=QwenVLDefaults.TEMPERATURE,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            exc_name = type(exc).__name__
+            msg = str(exc)
+
+            if isinstance(exc, AdapterError):
+                raise
+
+            try:
+                import openai as _openai
+
+                if isinstance(exc, _openai.RateLimitError):
+                    raise AdapterError(
+                        f"API rate limit exceeded on page {page_num}. Retry after a short wait. Detail: {msg}"
+                    ) from exc
+                if isinstance(exc, _openai.AuthenticationError):
+                    raise AdapterError(
+                        f"API authentication error. Check your API key. Detail: {msg}"
+                    ) from exc
+                if isinstance(exc, _openai.APITimeoutError):
+                    raise AdapterError(
+                        f"API request timed out on page {page_num}. Detail: {msg}"
+                    ) from exc
+                if isinstance(exc, _openai.APIConnectionError):
+                    raise AdapterError(
+                        f"Cannot connect to the API endpoint at '{base_url}'. Check that the server is running. Detail: {msg}"
+                    ) from exc
+            except AdapterError:
+                raise
+            except Exception:
+                pass
+
+            if "context" in msg.lower() and (
+                "exceed" in msg.lower() or "too long" in msg.lower() or "maximum context" in msg.lower()
+            ):
+                raise AdapterError(
+                    f"Page {page_num} exceeded model context window ({msg}). "
+                    f"Try increasing the context window on your serving endpoint (e.g. vLLM '--max-model-len 32768' or Ollama 'num_ctx 32768'), "
+                    f"or lower 'max_tokens' in profile settings."
+                ) from exc
+            if "429" in msg or "rate" in msg.lower():
+                raise AdapterError(f"API rate limit exceeded on page {page_num}. Detail: {msg}") from exc
+            if "401" in msg or "403" in msg or "auth" in msg.lower():
+                raise AdapterError(f"API authentication error. Detail: {msg}") from exc
+            if "timeout" in msg.lower() or "deadline" in msg.lower():
+                raise AdapterError(f"API request timed out on page {page_num}. Detail: {msg}") from exc
+            if "connection" in msg.lower() or "refused" in msg.lower():
+                raise AdapterError(f"Cannot connect to API endpoint at '{base_url}'. Detail: {msg}") from exc
+            raise AdapterError(f"API error on page {page_num} ({exc_name}): {msg}") from exc
+
+        try:
+            page_text: str = response.choices[0].message.content or ""
+        except (IndexError, AttributeError):
+            page_text = ""
+
+        if not page_text:
+            raise AdapterError(
+                f"The model returned an empty response for page {page_num}. "
+                "The page may be blank, corrupted, or unsupported."
+            )
+
+        # Ensure page delimiter is present in the output.
+        if f"PAGE_{page_num}" not in page_text.upper():
+            page_text = f"<<< PAGE_{page_num} >>>\n{page_text}"
+
+        usage: dict[str, Any] = {}
+        try:
+            if response.usage is not None:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens or 0,
+                    "completion_tokens": response.usage.completion_tokens or 0,
+                    "total_tokens": response.usage.total_tokens or 0,
+                }
+        except Exception:
+            pass
+
+        return page_text, usage
 
     def _call_model(
         self,
@@ -326,7 +438,10 @@ class QwenVLAdapter(X2TextAdapter):
         model_name: str,
         system_prompt: str,
     ) -> tuple[str, dict[str, Any]]:
-        """Submit document content to the OpenAI-compatible API.
+        """Submit document pages individually to the OpenAI-compatible API.
+
+        Processes multi-page documents page-by-page so that each page image
+        comfortably fits inside the model's available context window (e.g. 8192).
 
         Args:
             file_bytes: Raw document/image bytes.
@@ -352,102 +467,41 @@ class QwenVLAdapter(X2TextAdapter):
 
         base_url = self._resolve_base_url()
         api_key = self._resolve_api_key()
+        max_tokens = self._resolve_max_tokens()
 
-        try:
-            client = openai.OpenAI(base_url=base_url, api_key=api_key)
+        client = openai.OpenAI(base_url=base_url, api_key=api_key)
 
-            content_parts = self._build_image_content_parts(file_bytes, mime_type)
+        if mime_type == QwenVLMimeTypes.PDF:
+            page_images = self._pdf_to_base64_images(file_bytes)
+        else:
+            b64_data = self._image_to_base64(file_bytes, mime_type)
+            page_images = [(b64_data, mime_type)]
 
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content_parts},
-                ],
-                temperature=QwenVLDefaults.TEMPERATURE,
-                max_tokens=QwenVLDefaults.MAX_TOKENS,
+        page_texts: list[str] = []
+        total_usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        for idx, (b64_data, img_mime) in enumerate(page_images, 1):
+            page_text, usage = self._call_model_for_page(
+                client=client,
+                b64_data=b64_data,
+                img_mime=img_mime,
+                page_num=idx,
+                total_pages=len(page_images),
+                model_name=model_name,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                base_url=base_url,
             )
-        except Exception as exc:
-            # Map OpenAI SDK exceptions → AdapterError with helpful messages.
-            exc_name = type(exc).__name__
-            msg = str(exc)
+            page_texts.append(page_text)
+            for k in total_usage:
+                total_usage[k] += usage.get(k, 0)
 
-            if isinstance(exc, AdapterError):
-                raise
-
-            # Lazy check for specific openai exception types.
-            try:
-                import openai as _openai
-
-                if isinstance(exc, _openai.RateLimitError):
-                    raise AdapterError(
-                        f"API rate limit exceeded. Retry after a short wait. "
-                        f"Detail: {msg}"
-                    ) from exc
-                if isinstance(exc, _openai.AuthenticationError):
-                    raise AdapterError(
-                        f"API authentication error. Check your API key. Detail: {msg}"
-                    ) from exc
-                if isinstance(exc, _openai.APITimeoutError):
-                    raise AdapterError(
-                        f"API request timed out. Detail: {msg}"
-                    ) from exc
-                if isinstance(exc, _openai.APIConnectionError):
-                    raise AdapterError(
-                        f"Cannot connect to the API endpoint at '{base_url}'. "
-                        f"Check that the server is running. Detail: {msg}"
-                    ) from exc
-            except AdapterError:
-                raise
-            except Exception:
-                pass
-
-            # Generic fallback.
-            if "429" in msg or "rate" in msg.lower():
-                raise AdapterError(
-                    f"API rate limit exceeded. Detail: {msg}"
-                ) from exc
-            if "401" in msg or "403" in msg or "auth" in msg.lower():
-                raise AdapterError(
-                    f"API authentication error. Detail: {msg}"
-                ) from exc
-            if "timeout" in msg.lower() or "deadline" in msg.lower():
-                raise AdapterError(
-                    f"API request timed out. Detail: {msg}"
-                ) from exc
-            if "connection" in msg.lower() or "refused" in msg.lower():
-                raise AdapterError(
-                    f"Cannot connect to API endpoint at '{base_url}'. Detail: {msg}"
-                ) from exc
-            raise AdapterError(
-                f"API error ({exc_name}): {msg}"
-            ) from exc
-
-        # Extract text from the response.
-        try:
-            extracted_text: str = response.choices[0].message.content or ""
-        except (IndexError, AttributeError):
-            extracted_text = ""
-
-        if not extracted_text:
-            raise AdapterError(
-                "The model returned an empty response.  The document may be blank, "
-                "corrupted, or the model may not support this input format."
-            )
-
-        # Collect token usage metadata for the sidecar.
-        usage: dict[str, Any] = {}
-        try:
-            if response.usage is not None:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-        except Exception:
-            pass
-
-        return extracted_text, usage
+        raw_text = "\n\n".join(page_texts)
+        return raw_text, total_usage
 
     # ------------------------------------------------------------------
     # Public interface (X2TextAdapter contract)

@@ -294,7 +294,7 @@ class TestProcess(unittest.TestCase):
             result = adapter.process(input_file_path="doc.png", fs=fs)
 
         self.assertEqual(result.page_count, 1)
-        self.assertEqual(result.extracted_text, single_page_text)
+        self.assertIn(single_page_text, result.extracted_text)
 
     def test_model_name_configurable(self):
         """Confirm that a custom model_name reaches the OpenAI client."""
@@ -426,6 +426,17 @@ class TestProcessErrors(unittest.TestCase):
             with self.assertRaises(AdapterError) as ctx:
                 adapter.process(input_file_path="file.png", fs=fs)
         self.assertIn("empty", str(ctx.exception).lower())
+
+    def test_context_size_exceeded_raises_adapter_error(self):
+        adapter = _make_adapter()
+        fs = self._make_fs()
+
+        with self._make_failing_openai(
+            Exception("request (12421 tokens) exceeds the available context size (8192 tokens)")
+        ):
+            with self.assertRaises(AdapterError) as ctx:
+                adapter.process(input_file_path="file.png", fs=fs)
+        self.assertIn("context window", str(ctx.exception).lower())
 
     def test_missing_openai_package_raises(self):
         adapter = _make_adapter()
