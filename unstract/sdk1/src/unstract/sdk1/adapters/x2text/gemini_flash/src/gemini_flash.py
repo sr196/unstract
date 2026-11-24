@@ -238,7 +238,15 @@ class GeminiFlashAdapter(X2TextAdapter):
         api_key = self._resolve_api_key()
 
         try:
-            client = genai.Client(api_key=api_key)
+            http_options = genai_types.HttpOptions(
+                timeout=90_000,
+                retry_options=genai_types.HttpRetryOptions(
+                    attempts=3,
+                    initial_delay=1.0,
+                    max_delay=10.0,
+                ),
+            )
+            client = genai.Client(api_key=api_key, http_options=http_options)
 
             # Build the generation config.
             generation_config = genai_types.GenerateContentConfig(
@@ -270,6 +278,12 @@ class GeminiFlashAdapter(X2TextAdapter):
             exc_name = type(exc).__name__
             msg = str(exc)
 
+            if "503" in msg or "UNAVAILABLE" in msg or "high demand" in msg.lower():
+                raise AdapterError(
+                    f"Gemini API model is temporarily experiencing high demand (503 UNAVAILABLE). "
+                    f"Please try again shortly, switch to 'gemini-1.5-flash' in profile settings, "
+                    f"or use a paid Google AI Studio tier. Detail: {msg}"
+                ) from exc
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate" in msg.lower():
                 raise AdapterError(
                     f"Gemini API rate limit exceeded. Retry after a short wait. "
@@ -328,6 +342,7 @@ class GeminiFlashAdapter(X2TextAdapter):
         """
         try:
             import google.genai as genai  # type: ignore[import]
+            from google.genai import types as genai_types  # type: ignore[import]
         except ImportError as exc:
             raise AdapterError(
                 "The 'google-genai' package is not installed.  "
@@ -337,7 +352,15 @@ class GeminiFlashAdapter(X2TextAdapter):
         api_key = self._resolve_api_key()
         model_name = self._resolve_model_name()
         try:
-            client = genai.Client(api_key=api_key)
+            http_options = genai_types.HttpOptions(
+                timeout=15_000,
+                retry_options=genai_types.HttpRetryOptions(
+                    attempts=2,
+                    initial_delay=1.0,
+                    max_delay=5.0,
+                ),
+            )
+            client = genai.Client(api_key=api_key, http_options=http_options)
             # List models as a lightweight credential check.
             # If this fails with an auth error it surfaces before any real work.
             models = list(client.models.list())

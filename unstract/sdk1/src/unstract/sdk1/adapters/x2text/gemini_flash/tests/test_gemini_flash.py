@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from types import ModuleType
 import unittest
+
+# Stub python-magic so importing FileStorage does not depend on libmagic binary
+sys.modules.setdefault("magic", ModuleType("magic"))
+
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -198,21 +204,26 @@ def _patch_genai(response_text: str = FAKE_RESPONSE_TEXT):
     """Return a context-manager that patches google.genai inside the adapter module."""
     fake_response = _fake_genai_response(response_text)
 
+    mock_google = MagicMock()
     mock_genai = MagicMock()
+    mock_google.genai = mock_genai
     mock_client = MagicMock()
     mock_genai.Client.return_value = mock_client
     mock_client.models.generate_content.return_value = fake_response
 
     mock_types = MagicMock()
+    mock_google.genai.types = mock_types
     mock_types.GenerateContentConfig = MagicMock(return_value=MagicMock())
     mock_types.Part.from_bytes = MagicMock(return_value=MagicMock())
     mock_types.Part.from_text = MagicMock(return_value=MagicMock())
     mock_types.Content = MagicMock(return_value=MagicMock())
+    mock_types.HttpOptions = MagicMock(return_value=MagicMock())
+    mock_types.HttpRetryOptions = MagicMock(return_value=MagicMock())
 
     return patch.dict(
         "sys.modules",
         {
-            "google": MagicMock(),
+            "google": mock_google,
             "google.genai": mock_genai,
             "google.genai.types": mock_types,
         },
@@ -307,21 +318,35 @@ class TestProcessErrors(unittest.TestCase):
         return fs
 
     def _make_failing_genai(self, exc: Exception):
+        mock_google = MagicMock()
         mock_genai = MagicMock()
+        mock_google.genai = mock_genai
         mock_client = MagicMock()
         mock_genai.Client.return_value = mock_client
         mock_client.models.generate_content.side_effect = exc
 
         mock_types = MagicMock()
+        mock_google.genai.types = mock_types
         mock_types.GenerateContentConfig = MagicMock(return_value=MagicMock())
         mock_types.Part.from_bytes = MagicMock(return_value=MagicMock())
         mock_types.Part.from_text = MagicMock(return_value=MagicMock())
         mock_types.Content = MagicMock(return_value=MagicMock())
+        mock_types.HttpOptions = MagicMock(return_value=MagicMock())
+        mock_types.HttpRetryOptions = MagicMock(return_value=MagicMock())
 
         return patch.dict(
             "sys.modules",
-            {"google": MagicMock(), "google.genai": mock_genai, "google.genai.types": mock_types},
+            {"google": mock_google, "google.genai": mock_genai, "google.genai.types": mock_types},
         )
+
+    def test_overloaded_503_raises_adapter_error(self):
+        adapter = _make_adapter()
+        fs = self._make_fs()
+
+        with self._make_failing_genai(Exception("503 UNAVAILABLE: high demand")):
+            with self.assertRaises(AdapterError) as ctx:
+                adapter.process(input_file_path="file.pdf", fs=fs)
+        self.assertIn("high demand", str(ctx.exception).lower())
 
     def test_rate_limit_raises_adapter_error(self):
         adapter = _make_adapter()
@@ -354,21 +379,7 @@ class TestProcessErrors(unittest.TestCase):
         adapter = _make_adapter()
         fs = self._make_fs()
 
-        fake_resp = SimpleNamespace(text="", usage_metadata=None)
-        mock_genai = MagicMock()
-        mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
-        mock_client.models.generate_content.return_value = fake_resp
-        mock_types = MagicMock()
-        mock_types.GenerateContentConfig = MagicMock(return_value=MagicMock())
-        mock_types.Part.from_bytes = MagicMock(return_value=MagicMock())
-        mock_types.Part.from_text = MagicMock(return_value=MagicMock())
-        mock_types.Content = MagicMock(return_value=MagicMock())
-
-        with patch.dict(
-            "sys.modules",
-            {"google": MagicMock(), "google.genai": mock_genai, "google.genai.types": mock_types},
-        ):
+        with _patch_genai(response_text=""):
             with self.assertRaises(AdapterError) as ctx:
                 adapter.process(input_file_path="file.pdf", fs=fs)
         self.assertIn("empty", str(ctx.exception).lower())
@@ -397,35 +408,50 @@ class TestTestConnection(unittest.TestCase):
             model_names = ["models/gemini-2.0-flash", "models/gemini-1.5-pro"]
         models = [SimpleNamespace(name=n) for n in model_names]
 
+        mock_google = MagicMock()
         mock_genai = MagicMock()
+        mock_google.genai = mock_genai
+        mock_types = MagicMock()
+        mock_google.genai.types = mock_types
+        mock_types.HttpOptions = MagicMock(return_value=MagicMock())
+        mock_types.HttpRetryOptions = MagicMock(return_value=MagicMock())
+
         mock_client = MagicMock()
         mock_genai.Client.return_value = mock_client
         mock_client.models.list.return_value = iter(models)
-        return mock_genai
+        return mock_google, mock_genai, mock_types
 
     def test_success_returns_true(self):
         adapter = _make_adapter()
-        mock_genai = self._make_genai_with_models()
+        mock_google, mock_genai, mock_types = self._make_genai_with_models()
 
-        with patch.dict("sys.modules", {"google": MagicMock(), "google.genai": mock_genai}):
+        with patch.dict(
+            "sys.modules",
+            {"google": mock_google, "google.genai": mock_genai, "google.genai.types": mock_types},
+        ):
             self.assertTrue(adapter.test_connection())
 
     def test_auth_failure_raises_adapter_error(self):
         adapter = _make_adapter()
-        mock_genai = MagicMock()
-        mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
+        mock_google, mock_genai, mock_types = self._make_genai_with_models()
+        mock_client = mock_genai.Client.return_value
         mock_client.models.list.side_effect = Exception("403 permission denied")
 
-        with patch.dict("sys.modules", {"google": MagicMock(), "google.genai": mock_genai}):
+        with patch.dict(
+            "sys.modules",
+            {"google": mock_google, "google.genai": mock_genai, "google.genai.types": mock_types},
+        ):
             with self.assertRaises(AdapterError):
                 adapter.test_connection()
 
     def test_empty_model_list_raises(self):
         adapter = _make_adapter()
-        mock_genai = self._make_genai_with_models([])
+        mock_google, mock_genai, mock_types = self._make_genai_with_models([])
 
-        with patch.dict("sys.modules", {"google": MagicMock(), "google.genai": mock_genai}):
+        with patch.dict(
+            "sys.modules",
+            {"google": mock_google, "google.genai": mock_genai, "google.genai.types": mock_types},
+        ):
             with self.assertRaises(AdapterError):
                 adapter.test_connection()
 

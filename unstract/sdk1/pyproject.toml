@@ -51,6 +51,7 @@ dependencies = [
     # # Core utilities (Redis Sentinel-aware client factory, etc.)
     "unstract-core",
     "google-genai>=1.0.0",
+    "openai>=1.0.0",
 ]
 
 [project.optional-dependencies]
