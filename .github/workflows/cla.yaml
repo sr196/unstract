@@ -24,8 +24,8 @@ concurrency:
 jobs:
   cla:
     # Comments on issues (not PRs) never need a CLA check.
-    # Skip if CLA app credentials are not configured (e.g. in forks).
-    if: vars.CLA_APP_CLIENT_ID != '' && (github.event_name == 'pull_request_target' || github.event.issue.pull_request)
+    # CLA is only enforced on the upstream Zipstack/unstract repository.
+    if: github.repository == 'Zipstack/unstract' && (github.event_name == 'pull_request_target' || github.event.issue.pull_request)
     runs-on: ubuntu-latest
     steps:
       - name: Mint signatures token
