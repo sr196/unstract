@@ -38,7 +38,12 @@
       "title": "Custom System Prompt / Instructions",
       "default": "",
       "description": "Optional additional instructions appended to the built-in layout-preserving extraction prompt. Use this to customise output formatting, focus on specific sections, or handle domain-specific content."
+    },
+    "max_tokens": {
+      "type": "integer",
+      "title": "Max Output Tokens Per Page",
+      "default": 4096,
+      "description": "Maximum tokens to generate per page. Defaults to 4096. Lower this if your serving endpoint uses a small context window (e.g. 8192) and experiences context limit errors."
     }
   }
 }
-

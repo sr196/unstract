@@ -5,6 +5,7 @@ class QwenVLConfig:
     API_KEY = "api_key"
     MODEL_NAME = "model_name"
     CUSTOM_PROMPT = "custom_prompt"
+    MAX_TOKENS = "max_tokens"
 
 
 class QwenVLDefaults:
@@ -14,7 +15,13 @@ class QwenVLDefaults:
     BASE_URL = "http://localhost:8000/v1"
     API_KEY = "not-needed"
     TEMPERATURE = 0.0
-    MAX_TOKENS = 8192
+    # 4096 tokens per page fits comfortably within an 8192 context window
+    # alongside ~1200-1800 vision prompt tokens.
+    MAX_TOKENS = 4096
+    # Maximum dimension (width or height) for image inputs to avoid token explosion.
+    MAX_IMAGE_DIM = 1536
+    # PDF rasterization resolution in DPI (150 DPI is crisp for OCR while compact).
+    PDF_RENDER_DPI = 150
     # Page delimiter inserted by the extraction prompt and parsed to split pages.
     PAGE_DELIMITER_TEMPLATE = "<<< PAGE_{n} >>>"
     PAGE_DELIMITER_PREFIX = "<<< PAGE_"

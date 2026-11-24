@@ -96,15 +96,13 @@ client = genai.Client(api_key=api_key, http_options=http_options)
 ### Capabilities
 - **Engine**: Qwen 2.5 VL (or any OpenAI-compatible vision-language model) served on self-hosted infrastructure via vLLM, Ollama, TGI, SGLang, or LiteLLM proxy.
 - **Client**: Standard `openai` SDK pointing to custom `base_url`.
-- **PDF Ingestion Pipeline**: Because OpenAI-compatible vision endpoints do not accept raw PDF byte streams, the adapter automatically converts PDF pages to high-resolution PNG images in-memory using `pdfplumber` + `Pillow`:
-  ```python
-  page_image = page.to_image(resolution=200)
-  pil_img = page_image.original.convert("RGB")
-  ```
-  Rendered images are sent as base64-encoded `image_url` data parts (`data:image/png;base64,...`).
-- **Image Ingestion**: Single images (PNG, JPEG, GIF, WebP) are sent directly as base64 `image_url` parts.
+- **Per-Page Processing**: To avoid exceeding self-hosted models' context limits (e.g. 8192 tokens), multi-page documents are processed **page-by-page**. Each page is submitted independently to the LLM, and results are assembled into a unified document with standard `<<< PAGE_{n} >>>` delimiters.
+- **Dynamic Image Scaling & Resolution**:
+  - PDFs are rasterized at 150 DPI (optimal fidelity for OCR while remaining token-efficient).
+  - Images with dimensions larger than 1536px are automatically downscaled proportionally using Lanczos resampling. This guarantees each page consumes only ~1,200–1,800 vision prompt tokens, safely fitting inside 8k context windows.
+- **Image Ingestion**: Single images (PNG, JPEG, GIF, WebP) are processed directly with proportional downscaling if oversized.
 - **Temperature**: `0.0`.
-- **Max Output Tokens**: `8192`.
+- **Max Output Tokens**: `4096` per page (configurable).
 
 ### Configuration Reference
 
@@ -115,6 +113,13 @@ client = genai.Client(api_key=api_key, http_options=http_options)
 | `api_key` | string (password) | No | `not-needed` | API key (optional for self-hosted instances) |
 | `model_name` | string | No | `Qwen/Qwen2.5-VL-72B-Instruct` | Model identifier on the serving endpoint |
 | `custom_prompt` | string (textarea) | No | `""` | Additional user instructions appended to system prompt |
+| `max_tokens` | integer | No | `4096` | Max output tokens per page (lower if server has small context window) |
+
+### Context Window & Server Tuning
+If your self-hosted inference server has a small default context window (e.g. 8192), consider increasing it on the server startup command:
+- **vLLM**: `--max-model-len 32768` (or `--max-model-len 16384`)
+- **Ollama**: Set `num_ctx: 32768` in your Modelfile or request options
+- **SGLang / TGI**: `--context-length 32768` or `--max-total-tokens 32768`
 
 ### Environment Variable Fallbacks
 - `QWEN_BASE_URL`: Overrides empty `base_url`.
