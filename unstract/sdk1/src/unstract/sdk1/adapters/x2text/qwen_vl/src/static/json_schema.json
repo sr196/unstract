@@ -1,0 +1,44 @@
+{
+  "title": "Qwen 2.5 VL Text Extractor",
+  "type": "object",
+  "required": [
+    "adapter_name",
+    "base_url"
+  ],
+  "description": "Layout-preserving document extraction powered by Qwen 2.5 VL or any OpenAI-compatible vision-language model. Supports PDF, PNG, JPEG, GIF, and WebP inputs. Requires an OpenAI-compatible API endpoint URL (e.g. vLLM, Ollama, TGI).",
+  "properties": {
+    "adapter_name": {
+      "type": "string",
+      "title": "Name",
+      "default": "qwen-vl-1",
+      "description": "Provide a unique name for this adapter instance. Example: qwen-vl-1"
+    },
+    "base_url": {
+      "type": "string",
+      "title": "OpenAI-Compatible API URL",
+      "format": "uri",
+      "default": "http://localhost:8000/v1",
+      "description": "URL of your self-hosted OpenAI-compatible API endpoint. For vLLM: http://host:8000/v1, Ollama: http://host:11434/v1, TGI: http://host:8080/v1. Can also be set via the QWEN_BASE_URL environment variable."
+    },
+    "api_key": {
+      "type": "string",
+      "title": "API Key",
+      "format": "password",
+      "default": "not-needed",
+      "description": "API key for the endpoint. Most self-hosted servers (vLLM, Ollama) do not require an API key — leave as 'not-needed'. Can also be set via the QWEN_API_KEY environment variable."
+    },
+    "model_name": {
+      "type": "string",
+      "title": "Model Name",
+      "default": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "description": "Model identifier as registered on your serving endpoint. Examples: Qwen/Qwen2.5-VL-72B-Instruct, Qwen/Qwen2.5-VL-7B-Instruct, qwen2.5-vl:72b (Ollama)."
+    },
+    "custom_prompt": {
+      "type": "string",
+      "title": "Custom System Prompt / Instructions",
+      "default": "",
+      "description": "Optional additional instructions appended to the built-in layout-preserving extraction prompt. Use this to customise output formatting, focus on specific sections, or handle domain-specific content."
+    }
+  }
+}
+

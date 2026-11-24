@@ -45,6 +45,7 @@ dependencies = [
     # Custom implementations replace tenancy (retry), pybreaker (circuit breaker)
     # - python-dateutil: Standard datetime module sufficient
     "google-genai>=1.0.0",
+    "openai>=1.0.0",
 ]
 
 [dependency-groups]
