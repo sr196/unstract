@@ -127,6 +127,48 @@ class TestSplitPages(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _is_delimiter_only
+# ---------------------------------------------------------------------------
+
+class TestIsDelimiterOnly(unittest.TestCase):
+    """Unit tests for the ``_is_delimiter_only`` helper."""
+
+    def test_delimiter_only_single(self):
+        self.assertTrue(
+            QwenVLAdapter._is_delimiter_only("<<< PAGE_1 >>>")
+        )
+
+    def test_delimiter_only_multi(self):
+        text = "<<< PAGE_1 >>>\n\n<<< PAGE_2 >>>\n\n<<< PAGE_3 >>>"
+        self.assertTrue(QwenVLAdapter._is_delimiter_only(text))
+
+    def test_delimiter_with_whitespace_only(self):
+        text = "  <<< PAGE_1 >>>  \n  \n  <<< PAGE_2 >>>  "
+        self.assertTrue(QwenVLAdapter._is_delimiter_only(text))
+
+    def test_real_content_returns_false(self):
+        text = "<<< PAGE_1 >>>\nThis is actual content."
+        self.assertFalse(QwenVLAdapter._is_delimiter_only(text))
+
+    def test_no_delimiters_with_text_returns_false(self):
+        self.assertFalse(
+            QwenVLAdapter._is_delimiter_only("Just some plain text.")
+        )
+
+    def test_empty_string_returns_true(self):
+        # Edge case: empty string has no content
+        self.assertTrue(QwenVLAdapter._is_delimiter_only(""))
+
+    def test_whitespace_only_returns_true(self):
+        self.assertTrue(QwenVLAdapter._is_delimiter_only("   \n\n  "))
+
+    def test_case_insensitive(self):
+        self.assertTrue(
+            QwenVLAdapter._is_delimiter_only("<<< page_1 >>>")
+        )
+
+
+# ---------------------------------------------------------------------------
 # MIME type detection
 # ---------------------------------------------------------------------------
 
@@ -437,6 +479,21 @@ class TestProcessErrors(unittest.TestCase):
             with self.assertRaises(AdapterError) as ctx:
                 adapter.process(input_file_path="file.png", fs=fs)
         self.assertIn("context window", str(ctx.exception).lower())
+
+    def test_delimiter_only_response_raises_adapter_error(self):
+        """When the model returns only page delimiters with no text,
+        it should raise AdapterError with guidance about --mmproj."""
+        adapter = _make_adapter()
+        fs = self._make_fs()
+
+        # Simulate a response that is just the delimiter — no actual content
+        delimiter_only_text = "<<< PAGE_1 >>>"
+        with _patch_openai(response_text=delimiter_only_text):
+            with self.assertRaises(AdapterError) as ctx:
+                adapter.process(input_file_path="file.png", fs=fs)
+        error_msg = str(ctx.exception).lower()
+        self.assertIn("delimiter", error_msg)
+        self.assertIn("--mmproj", str(ctx.exception))
 
     def test_missing_openai_package_raises(self):
         adapter = _make_adapter()
