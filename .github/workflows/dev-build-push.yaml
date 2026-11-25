@@ -1,0 +1,248 @@
+name: Dev – Build & Push Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Docker image tag (e.g. dev-mybranch, main, v0.50.0-dev)"
+        required: true
+        default: "dev-latest"
+      services:
+        description: "Comma-separated services to build (leave empty for ALL)"
+        required: false
+        default: ""
+      add_latest_tag:
+        description: "Also push an additional ':latest' tag"
+        type: boolean
+        default: false
+      minimal_build:
+        description: "Use MINIMAL_BUILD=1 for worker-unified (faster, dev-only)"
+        type: boolean
+        default: false
+      dockerhub_namespace:
+        description: "Docker Hub namespace / username to push to (e.g. your personal hub username)"
+        required: false
+        default: ""
+      platforms:
+        description: "Target platforms"
+        required: false
+        default: "linux/amd64"
+        type: choice
+        options:
+          - "linux/amd64"
+          - "linux/arm64/v8"
+          - "linux/amd64,linux/arm64/v8"
+
+run-name: "[${{ inputs.tag }}] Dev Build & Push → ${{ inputs.dockerhub_namespace || secrets.DOCKERHUB_USERNAME }}"
+
+# Only the checkout token is needed; Docker Hub is reached via secrets.
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref so a re-trigger doesn't queue up.
+concurrency:
+  group: dev-build-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Resolve which services to build.  Defaults to the full set
+  # defined in docker-compose.build.yaml when the input is blank.
+  # ─────────────────────────────────────────────────────────────
+  resolve-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Determine service matrix
+        id: set-matrix
+        env:
+          INPUT_SERVICES: ${{ inputs.services }}
+        run: |
+          ALL_SERVICES='["backend","frontend","platform-service","runner","worker-unified","x2text-service"]'
+
+          if [ -z "$INPUT_SERVICES" ]; then
+            echo "matrix=${ALL_SERVICES}" >> "$GITHUB_OUTPUT"
+          else
+            # Convert comma-separated input to a JSON array
+            JSON=$(echo "$INPUT_SERVICES" | tr ',' '\n' | \
+                   jq -Rsc 'split("\n") | map(select(length > 0))')
+            echo "matrix=${JSON}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # Build & push each service in parallel matrix jobs
+  # ─────────────────────────────────────────────────────────────
+  build-and-push:
+    needs: resolve-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # keep building other services even if one fails
+      matrix:
+        service: ${{ fromJson(needs.resolve-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Map service name → Dockerfile + build-args
+      - name: Resolve Dockerfile for ${{ matrix.service }}
+        id: cfg
+        env:
+          SERVICE: ${{ matrix.service }}
+          MINIMAL_BUILD: ${{ inputs.minimal_build && '1' || '0' }}
+        run: |
+          case "$SERVICE" in
+            backend)
+              echo "dockerfile=docker/dockerfiles/backend.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            frontend)
+              echo "dockerfile=docker/dockerfiles/frontend.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            platform-service)
+              echo "dockerfile=docker/dockerfiles/platform.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            runner)
+              echo "dockerfile=docker/dockerfiles/runner.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            worker-unified)
+              echo "dockerfile=docker/dockerfiles/worker-unified.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=MINIMAL_BUILD=${MINIMAL_BUILD}" >> "$GITHUB_OUTPUT"
+              ;;
+            x2text-service)
+              echo "dockerfile=docker/dockerfiles/x2text.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            tool-sidecar)
+              echo "dockerfile=docker/dockerfiles/tool-sidecar.Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            tool-classifier)
+              echo "dockerfile=tools/classifier/Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            tool-text-extractor|tool-text_extractor)
+              echo "dockerfile=tools/text_extractor/Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "build_args=" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unknown service '$SERVICE'"
+              exit 1
+              ;;
+          esac
+
+      # Compute final Docker Hub tags
+      # Namespace priority: explicit input → DOCKERHUB_USERNAME secret → error
+      - name: Compute image tags
+        id: tags
+        env:
+          SERVICE: ${{ matrix.service }}
+          TAG: ${{ inputs.tag }}
+          ADD_LATEST: ${{ inputs.add_latest_tag }}
+          INPUT_NS: ${{ inputs.dockerhub_namespace }}
+          SECRET_NS: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          # Resolve namespace: explicit input wins, then fall back to the login username
+          NAMESPACE="${INPUT_NS:-$SECRET_NS}"
+          if [ -z "$NAMESPACE" ]; then
+            echo "::error::No Docker Hub namespace found. Set the 'dockerhub_namespace' input or the DOCKERHUB_USERNAME secret."
+            exit 1
+          fi
+
+          TAGS="${NAMESPACE}/${SERVICE}:${TAG}"
+          if [ "$ADD_LATEST" = "true" ]; then
+            TAGS="${TAGS}
+          ${NAMESPACE}/${SERVICE}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ inputs.platforms }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.cfg.outputs.dockerfile }}
+          build-args: ${{ steps.cfg.outputs.build_args }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Per-service GHA cache keeps layers across runs
+          cache-from: type=gha,scope=dev-${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=dev-${{ matrix.service }}
+
+      # Save per-service result so the summary job can aggregate
+      - name: Record build result
+        if: always()
+        env:
+          SERVICE: ${{ matrix.service }}
+          OUTCOME: ${{ job.status }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p build-status
+          echo "{\"service\":\"${SERVICE}\",\"status\":\"${OUTCOME}\",\"tag\":\"${TAG}\"}" \
+            > "build-status/${SERVICE}.json"
+
+      - name: Upload build-status artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-status-${{ matrix.service }}
+          path: build-status/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────
+  # Aggregate results & write a job summary
+  # ─────────────────────────────────────────────────────────────
+  summary:
+    if: always()
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build-status artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-status-*
+          merge-multiple: true
+          path: build-status/
+
+      - name: Write job summary
+        run: |
+          echo "## Dev Build & Push — ${{ inputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Namespace:** \`${{ inputs.dockerhub_namespace || secrets.DOCKERHUB_USERNAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service | Status | Tag |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|--------|-----|" >> "$GITHUB_STEP_SUMMARY"
+          for f in build-status/*.json; do
+            SVC=$(jq -r '.service' "$f")
+            STATUS=$(jq -r '.status' "$f")
+            TAG=$(jq -r '.tag' "$f")
+            if [ "$STATUS" = "success" ]; then ICON="✅"; else ICON="❌"; fi
+            echo "| ${SVC} | ${ICON} ${STATUS} | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+            >> "$GITHUB_STEP_SUMMARY"
+

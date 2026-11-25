@@ -233,8 +233,9 @@ class QwenVLAdapter(X2TextAdapter):
                     page_image = page.to_image(resolution=QwenVLDefaults.PDF_RENDER_DPI)
                     pil_img: Image.Image = page_image.original
 
-                    # Convert to RGB if needed (e.g. RGBA, P mode).
-                    if pil_img.mode not in ("RGB", "L"):
+                    # Always convert to RGB — RGBA, P, L, LA modes cause
+                    # silent image drops on some backends (notably LM Studio).
+                    if pil_img.mode != "RGB":
                         pil_img = pil_img.convert("RGB")
 
                     # Cap maximum dimension to avoid excessive vision tokens.
@@ -249,10 +250,13 @@ class QwenVLAdapter(X2TextAdapter):
                             new_w = max(1, int(w * (max_dim / h)))
                         pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
+                    # Save as JPEG — universally supported by all backends
+                    # (vLLM, llama.cpp, LM Studio, Ollama, TGI).  PNG can
+                    # be silently dropped by some implementations.
                     buf = BytesIO()
-                    pil_img.save(buf, format="PNG")
+                    pil_img.save(buf, format="JPEG", quality=95)
                     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                    images.append((b64, "image/png"))
+                    images.append((b64, "image/jpeg"))
         except AdapterError:
             raise
         except Exception as exc:
@@ -265,12 +269,25 @@ class QwenVLAdapter(X2TextAdapter):
         return images
 
     @staticmethod
-    def _image_to_base64(file_bytes: bytes, mime_type: str) -> str:
-        """Encode raw image bytes as a base64 string, downscaling if oversized."""
+    def _image_to_base64(file_bytes: bytes, mime_type: str) -> tuple[str, str]:
+        """Encode raw image bytes as a base64 string, normalizing to RGB JPEG.
+
+        Always converts to RGB JPEG for maximum compatibility across backends
+        (vLLM, llama.cpp, LM Studio, Ollama, TGI).  Some backends silently
+        drop PNG or RGBA images.
+
+        Returns:
+            A tuple of ``(base64_encoded_data, effective_mime_type)``.
+        """
         try:
             from PIL import Image  # type: ignore[import]
 
             img = Image.open(BytesIO(file_bytes))
+
+            # Normalize to RGB — RGBA, P, L, LA can cause silent drops.
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
             max_dim = QwenVLDefaults.MAX_IMAGE_DIM
             w, h = img.size
             if max(w, h) > max_dim:
@@ -281,13 +298,13 @@ class QwenVLAdapter(X2TextAdapter):
                     new_h = max_dim
                     new_w = max(1, int(w * (max_dim / h)))
                 img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                buf = BytesIO()
-                save_fmt = "JPEG" if mime_type in (QwenVLMimeTypes.JPEG, "image/jpeg") else "PNG"
-                img.save(buf, format=save_fmt)
-                return base64.b64encode(buf.getvalue()).decode("ascii")
+
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=95)
+            return base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
         except Exception:
             pass
-        return base64.b64encode(file_bytes).decode("ascii")
+        return base64.b64encode(file_bytes).decode("ascii"), mime_type
 
     @staticmethod
     def _write_metadata(
@@ -315,6 +332,19 @@ class QwenVLAdapter(X2TextAdapter):
         except Exception as exc:
             logger.warning("QwenVL: could not write metadata sidecar: %s", exc)
 
+    @staticmethod
+    def _is_delimiter_only(text: str) -> bool:
+        """Return True when *text* contains only page delimiters and whitespace.
+
+        This detects the pathological case where the model ignores the image
+        (e.g. because the serving endpoint lacks a vision projector) and returns
+        nothing but ``<<< PAGE_N >>>`` markers.
+        """
+        stripped = re.sub(
+            r"<<<\s*PAGE_\d+\s*>>>", "", text, flags=re.IGNORECASE
+        ).strip()
+        return len(stripped) == 0
+
     def _call_model_for_page(
         self,
         client: Any,
@@ -328,19 +358,36 @@ class QwenVLAdapter(X2TextAdapter):
         base_url: str,
     ) -> tuple[str, dict[str, Any]]:
         """Submit a single page image to the model and return its extracted text."""
+        # Build the user-facing instruction text.  We embed a condensed version
+        # of the extraction rules directly into the user message so that
+        # backends which silently drop or underweight system messages (e.g.
+        # LM Studio, smaller VLM variants) still see the instructions.
+        user_instruction = (
+            f"[INSTRUCTIONS]\n"
+            f"{system_prompt}\n\n"
+            f"[TASK]\n"
+            f"This is page {page_num} of {total_pages} of a document. "
+            f"Extract ALL text content from this page image exactly as it "
+            f"appears. Begin your output with the delimiter "
+            f"<<< PAGE_{page_num} >>> on its own line, followed by the "
+            f"full transcribed text of the page. If the page contains "
+            f"tables, preserve them as Markdown tables. Output ONLY the "
+            f"delimiter and the extracted text — nothing else."
+        )
+
+        # NOTE: Text part comes FIRST, then the image.  Some OpenAI-compatible
+        # backends (notably llama.cpp / llama-server) silently drop image data
+        # if it precedes the text content part.
         content_parts = [
+            {
+                "type": "text",
+                "text": user_instruction,
+            },
             {
                 "type": "image_url",
                 "image_url": {
                     "url": f"data:{img_mime};base64,{b64_data}",
                 },
-            },
-            {
-                "type": "text",
-                "text": (
-                    f"Extract all text from page {page_num} of this document, inserting "
-                    f"<<< PAGE_{page_num} >>> delimiters as instructed."
-                ),
             },
         ]
 
@@ -348,7 +395,6 @@ class QwenVLAdapter(X2TextAdapter):
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content_parts},
                 ],
                 temperature=QwenVLDefaults.TEMPERATURE,
@@ -414,6 +460,30 @@ class QwenVLAdapter(X2TextAdapter):
                 "The page may be blank, corrupted, or unsupported."
             )
 
+        # Detect the pathological "delimiter-only" response — the model echoed
+        # the page marker but produced no actual content.  This almost always
+        # means the serving endpoint is NOT processing the image (e.g. llama.cpp
+        # launched without --mmproj, or the model is text-only).
+        if self._is_delimiter_only(page_text):
+            logger.warning(
+                "QwenVL: page %d response contains ONLY the page delimiter "
+                "and no extracted text.  The model may not be processing "
+                "image inputs.  Completion tokens: %s",
+                page_num,
+                getattr(getattr(response, "usage", None), "completion_tokens", "N/A"),
+            )
+            raise AdapterError(
+                f"The model returned only the page delimiter for page {page_num} "
+                f"with no extracted text.  This usually means the serving endpoint "
+                f"is NOT processing vision/image inputs.  "
+                f"If you are using llama.cpp / llama-server, ensure you launched it "
+                f"with the '--mmproj <projector.gguf>' flag so the model can see "
+                f"images.  If you are using Ollama, verify the model tag supports "
+                f"vision (e.g. 'qwen2.5-vl:7b').  "
+                f"If you are using vLLM, ensure the model was loaded with "
+                f"'--trust-remote-code' and '--limit-mm-per-prompt image=4'."
+            )
+
         # Ensure page delimiter is present in the output.
         if f"PAGE_{page_num}" not in page_text.upper():
             page_text = f"<<< PAGE_{page_num} >>>\n{page_text}"
@@ -474,8 +544,8 @@ class QwenVLAdapter(X2TextAdapter):
         if mime_type == QwenVLMimeTypes.PDF:
             page_images = self._pdf_to_base64_images(file_bytes)
         else:
-            b64_data = self._image_to_base64(file_bytes, mime_type)
-            page_images = [(b64_data, mime_type)]
+            b64_data, effective_mime = self._image_to_base64(file_bytes, mime_type)
+            page_images = [(b64_data, effective_mime)]
 
         page_texts: list[str] = []
         total_usage: dict[str, int] = {
